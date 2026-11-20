@@ -1,0 +1,29 @@
+
+name: ER068 Required PR Check
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  er068-required-check:
+    name: ER068 Required Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate ER068 test condition
+        shell: bash
+        run: |
+          if [ -f "er068-test/force-fail.txt" ]; then
+            echo "ER068 test: required check deliberately failed"
+            exit 1
+          fi
+
+          echo "ER068 test: required check passed"
