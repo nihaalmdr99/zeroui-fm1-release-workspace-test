@@ -1,0 +1,48 @@
+
+name: FM1 CI ER056 Cancellation Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Cancel a running workflow or test successful recovery"
+        required: true
+        type: choice
+        options:
+          - cancel
+          - pass
+        default: cancel
+
+permissions:
+  contents: read
+
+jobs:
+  ci-gate:
+    name: FM1 CI Cancellation Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Verify test mode
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$TEST_MODE" != "cancel" ] && \
+             [ "$TEST_MODE" != "pass" ]; then
+            echo "Unsupported test mode"
+            exit 1
+          fi
+
+      - name: Execute required CI workflow
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$TEST_MODE" = "cancel" ]; then
+            echo "ER-056 test: workflow running."
+            echo "Cancel this run from GitHub Actions."
+            sleep 300
+          else
+            echo "ER-056 recovery: required workflow passed."
+          fi
