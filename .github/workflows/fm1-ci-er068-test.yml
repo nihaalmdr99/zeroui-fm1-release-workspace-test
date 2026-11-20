@@ -1,0 +1,35 @@
+
+name: FM1 CI ER068 Failure Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Fail to test detection; pass to verify remediation"
+        required: true
+        type: choice
+        options:
+          - fail
+          - pass
+        default: fail
+
+permissions:
+  contents: read
+
+jobs:
+  ci-gate:
+    name: FM1 CI Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Evaluate test condition
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$TEST_MODE" = "fail" ]; then
+            echo "Intentional CI failure for ER-068 validation"
+            exit 1
+          fi
+
+          echo "CI gate passed after remediation"

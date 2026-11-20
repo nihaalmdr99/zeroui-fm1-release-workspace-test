@@ -1,0 +1,168 @@
+
+name: FM1 CI ER068 Completion Reporter
+
+on:
+  workflow_run:
+    workflows:
+      - FM1 CI ER068 Failure Test
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  report-ci-result:
+    if: >-
+      ${{
+        (github.event.workflow_run.conclusion == 'failure' ||
+         github.event.workflow_run.conclusion == 'success') &&
+        github.event.workflow_run.event == 'workflow_dispatch' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Report CI result to ZeroUI
+        shell: bash
+        env:
+          FM1_URL: ${{ vars.FM1_PUBLIC_BASE_URL }}
+          FM1_TOKEN: ${{ secrets.FM1_SIGNAL_INTAKE_AUTH_TOKEN }}
+          TENANT_ID: ${{ vars.FM1_TENANT_ID }}
+          RELEASE_ID: ${{ vars.FM1_RELEASE_ID }}
+          RECHECK_BLOCKER_ID: ${{ vars.FM1_ER068_RECHECK_BLOCKER_ID }}
+          RECHECK_EVENT_ID: ${{ vars.FM1_ER068_RECHECK_EVENT_ID }}
+          TARGET_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+          TARGET_RUN_ID: ${{ github.event.workflow_run.id }}
+          TARGET_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          TARGET_NAME: ${{ github.event.workflow_run.name }}
+          TARGET_URL: ${{ github.event.workflow_run.html_url }}
+          TARGET_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+          from urllib.parse import urlsplit
+
+          def required(name):
+              value = os.environ.get(name, "").strip()
+              if not value:
+                  raise SystemExit(f"Missing required setting: {name}")
+              return value
+
+          base = required("FM1_URL").rstrip("/")
+          token = required("FM1_TOKEN")
+          tenant = required("TENANT_ID")
+          release = required("RELEASE_ID")
+          conclusion = required("TARGET_CONCLUSION")
+
+          parsed = urlsplit(base)
+          if parsed.scheme != "https" or not parsed.netloc:
+              raise SystemExit("FM1_URL must be HTTPS")
+
+          if conclusion not in {"failure", "success"}:
+              raise SystemExit("Unsupported CI conclusion")
+
+          passed = conclusion == "success"
+          run_id = required("TARGET_RUN_ID")
+          attempt = required("TARGET_ATTEMPT")
+          event_id = f"github-ci-er068-{run_id}-{attempt}"
+
+          payload = {
+              "required_gate": True,
+              "workflow_completed": True,
+              "workflow_failed": not passed,
+              "workflow_conclusion": conclusion,
+              "scan_passed": passed,
+              "workflow_run_id": run_id,
+              "workflow_run_url": required("TARGET_URL")
+          }
+
+          if passed:
+              payload.update({
+                  "ci_recheck": True,
+                  "recheck_of_blocker_id": required("RECHECK_BLOCKER_ID"),
+                  "recheck_of_normalized_event_id": required("RECHECK_EVENT_ID"),
+                  "recheck_reason": "successful_followup_ci_workflow_run"
+              })
+
+          signal = {
+              "schema_version": "1",
+              "event_type_id": "ci.workflow.failed",
+              "source_system": "ci_cd",
+              "signal_method": "pipeline_job",
+              "provider": "github_actions",
+              "tenant_id": tenant,
+              "release_key": release,
+              "release_id": release,
+              "repository": required("TARGET_REPO"),
+              "branch": required("TARGET_BRANCH"),
+              "commit_hash": required("TARGET_SHA"),
+              "trace_id": event_id,
+              "source_event_id": event_id,
+              "workflow_run_id": run_id,
+              "run_id": run_id,
+              "pipeline_id": run_id,
+              "workflow_name": required("TARGET_NAME"),
+              "payload": payload,
+              "raw_metadata": {
+                  "ci_runner_marker": "github_actions",
+                  "ci_runner_detected": True
+              }
+          }
+
+          request = urllib.request.Request(
+              base + "/fm1/v1/ci/signals",
+              data=json.dumps(signal).encode("utf-8"),
+              headers={
+                  "Content-Type": "application/json",
+                  "X-FM1-Signal-Intake-Auth-Token": token
+              },
+              method="POST"
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+                  print("HTTP status:", response.status)
+          except urllib.error.HTTPError as exc:
+              print("FM1 HTTP status:", exc.code)
+              raise SystemExit("FM1 CI signal request failed") from exc
+
+          for key in (
+              "accepted",
+              "ingest_status",
+              "routing_status",
+              "mapped_trigger_id",
+              "decision_status",
+              "decision_outcome",
+              "normalized_event_id",
+              "receipt_ref",
+              "reason_code"
+          ):
+              print(f"{key}: {result.get(key)}")
+
+          expected = "pass" if passed else "hard_block"
+
+          if result.get("accepted") is not True:
+              raise SystemExit("FM1 rejected signal")
+
+          if result.get("mapped_trigger_id") != "ER-068":
+              raise SystemExit("Incorrect ER mapping")
+
+          if result.get("decision_status") != "decided":
+              raise SystemExit("FM1 decision incomplete")
+
+          if result.get("decision_outcome") != expected:
+              raise SystemExit("Unexpected policy decision")
+
+          if not result.get("receipt_ref"):
+              raise SystemExit("Missing decision receipt")
+
+          print("ER-068 CI signal verification passed")
+          PY
