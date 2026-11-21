@@ -1,0 +1,234 @@
+
+name: FM1 CI ER053 Completion Reporter
+
+on:
+  workflow_run:
+    workflows:
+      - FM1 CI ER053 Security Scan Test
+    types:
+      - completed
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  report-ci-result:
+    if: >-
+      ${{
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'workflow_dispatch' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download genuine scanner evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: fm1-er053-security-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: er053-evidence
+
+      - name: Verify security scan and report ER-053 to ZeroUI
+        shell: bash
+        env:
+          FM1_URL: ${{ vars.FM1_PUBLIC_BASE_URL }}
+          FM1_TOKEN: ${{ secrets.FM1_SIGNAL_INTAKE_AUTH_TOKEN }}
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TENANT_ID: ${{ vars.FM1_TENANT_ID }}
+          RELEASE_ID: ${{ vars.FM1_RELEASE_ID }}
+          RECHECK_BLOCKER_ID: ${{ vars.FM1_ER053_RECHECK_BLOCKER_ID }}
+          RECHECK_EVENT_ID: ${{ vars.FM1_ER053_RECHECK_EVENT_ID }}
+          TARGET_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+          TARGET_RUN_ID: ${{ github.event.workflow_run.id }}
+          TARGET_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          TARGET_NAME: ${{ github.event.workflow_run.name }}
+          TARGET_TITLE: ${{ github.event.workflow_run.display_title }}
+          TARGET_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          def required(key):
+              value = os.environ.get(key, '').strip()
+              if not value:
+                  raise SystemExit(f'Missing required setting: {key}')
+              return value
+
+          repo = required('TARGET_REPO')
+          if repo != required('GITHUB_REPOSITORY'):
+              raise SystemExit('Unexpected repository')
+          run_id = required('TARGET_RUN_ID')
+          attempt = required('TARGET_ATTEMPT')
+          sha = required('TARGET_SHA')
+          proof = Path('er053-evidence')
+          summary = json.loads((proof / 'summary.json').read_text(encoding='utf-8'))
+          report = json.loads((proof / 'scan.json').read_text(encoding='utf-8'))
+          fixture = proof / 'fixture.py'
+          if summary.get('schema') != 'zeroui.er053.bandit_fixture.v1':
+              raise SystemExit('Unexpected scanner evidence schema')
+          mode = summary.get('mode')
+          if mode not in ('detect', 'pass'):
+              raise SystemExit('Unexpected scanner mode')
+          if (summary.get('run_id') != run_id or
+              str(summary.get('run_attempt')) != attempt or
+              summary.get('commit_sha') != sha):
+              raise SystemExit('Scanner evidence belongs to a different run')
+          if required('TARGET_TITLE') != f'ER053 {mode} security fixture':
+              raise SystemExit('GitHub run title does not match scanner mode')
+          if (summary.get('scanner') != 'bandit' or
+              summary.get('scanner_version') != '1.9.4' or
+              summary.get('severity_filter') != 'HIGH' or
+              summary.get('scope') != 'controlled_python_sast_fixture'):
+              raise SystemExit('Unexpected scanner or evidence scope')
+          if summary.get('fixture_sha256') != hashlib.sha256(fixture.read_bytes()).hexdigest():
+              raise SystemExit('Fixture source hash mismatch')
+          if report.get('errors'):
+              raise SystemExit('Scanner reported analysis errors')
+          findings = report.get('results')
+          if not isinstance(findings, list):
+              raise SystemExit('Invalid Bandit results')
+          if (summary.get('finding_count') != len(findings) or
+              summary.get('finding_ids') != [f.get('test_id') for f in findings] or
+              summary.get('scan_passed') != (len(findings) == 0)):
+              raise SystemExit('Scan summary and scanner findings disagree')
+          if mode == 'detect':
+              if (len(findings) != 1 or
+                  findings[0].get('test_id') != 'B602' or
+                  findings[0].get('issue_severity') != 'HIGH' or
+                  findings[0].get('issue_confidence') != 'HIGH' or
+                  summary.get('scan_returncode') != 1):
+                  raise SystemExit('Expected HIGH confidence B602 finding missing')
+          elif findings or summary.get('scan_returncode') != 0:
+              raise SystemExit('Security scan recovery not proved')
+
+          api = (f'https://api.github.com/repos/{repo}/actions/runs/'
+                 f'{run_id}/attempts/{attempt}/jobs?per_page=100')
+          job_request = urllib.request.Request(api, headers={
+              'Authorization': 'Bearer ' + required('GH_API_TOKEN'),
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'User-Agent': 'ZeroUI-ER053-Reporter',
+          })
+          try:
+              with urllib.request.urlopen(job_request, timeout=30) as response:
+                  job_data = json.load(response)
+          except urllib.error.HTTPError as exc:
+              raise SystemExit(f'GitHub job lookup HTTP {exc.code}') from None
+          jobs = job_data.get('jobs')
+          if not isinstance(jobs, list) or job_data.get('total_count') != 1:
+              raise SystemExit('Expected exactly one scan job')
+          job = jobs[0]
+          if (job.get('name') != 'FM1 ER053 Security Scan' or
+              job.get('status') != 'completed' or job.get('conclusion') != 'success'):
+              raise SystemExit('Source scan job did not finish successfully')
+          steps = {step['name']: step['conclusion'] for step in job.get('steps', [])}
+          if (steps.get('Scan controlled Python fixture') != 'success' or
+              steps.get('Upload security scan evidence') != 'success'):
+              raise SystemExit('Scan or evidence upload was unsuccessful')
+
+          base = required('FM1_URL').rstrip('/')
+          url = urlsplit(base)
+          if (url.scheme != 'https' or not url.hostname or url.username or
+              url.password or url.path not in ('', '/') or url.query or url.fragment):
+              raise SystemExit('FM1 public endpoint must be an HTTPS origin')
+
+          print('Verified scanner: Bandit 1.9.4')
+          print('Mode:', mode)
+          print('Actual HIGH severity findings:', len(findings))
+          print('Finding types:', [f.get('test_id') for f in findings])
+          event_id = f'github-ci-er053-{run_id}-{attempt}-{job["id"]}'
+          payload = {
+              'scan_type': 'sast',
+              'scan_tool': 'bandit',
+              'scan_scope': 'controlled_python_sast_fixture',
+              'finding_count': len(findings),
+              'finding_ids': [f['test_id'] for f in findings],
+              'scan_passed': len(findings) == 0,
+              'security_scan_failed': len(findings) > 0,
+              'required_gate': True,
+              'workflow_completed': True,
+              'workflow_run_id': run_id,
+              'workflow_run_url': required('TARGET_URL'),
+              'job_id': job['id'],
+              'job_url': job.get('html_url'),
+          }
+          if findings:
+              payload['severity'] = 'high'  # Actual Bandit issue severity, not a claimed critical issue.
+          if mode == 'pass':
+              payload.update({
+                  'ci_recheck': True,
+                  'recheck_of_blocker_id': required('RECHECK_BLOCKER_ID'),
+                  'recheck_of_normalized_event_id': required('RECHECK_EVENT_ID'),
+                  'recheck_reason': 'remediated_security_scan_verified',
+              })
+
+          signal = {
+              'schema_version': '1',
+              'event_type_id': 'ci.security_scan.failed',
+              'source_system': 'ci_cd',
+              'signal_method': 'pipeline_job',
+              'provider': 'github_actions',
+              'tenant_id': required('TENANT_ID'),
+              'release_key': required('RELEASE_ID'),
+              'release_id': required('RELEASE_ID'),
+              'repository': repo,
+              'branch': required('TARGET_BRANCH'),
+              'commit_hash': sha,
+              'trace_id': event_id,
+              'source_event_id': event_id,
+              'workflow_run_id': run_id,
+              'run_id': run_id,
+              'pipeline_id': run_id,
+              'workflow_name': required('TARGET_NAME'),
+              'payload': payload,
+              'raw_metadata': {
+                  'ci_runner_marker': 'github_actions',
+                  'ci_runner_detected': True,
+              },
+          }
+          request = urllib.request.Request(
+              base + '/fm1/v1/ci/signals',
+              data=json.dumps(signal).encode('utf-8'),
+              headers={
+                  'Content-Type': 'application/json',
+                  'X-FM1-Signal-Intake-Auth-Token': required('FM1_TOKEN'),
+              },
+              method='POST',
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+                  print('FM1 HTTP status:', response.status)
+          except urllib.error.HTTPError as exc:
+              print('FM1 HTTP status:', exc.code)
+              raise SystemExit('FM1 rejected the ER-053 signal') from None
+          except urllib.error.URLError as exc:
+              raise SystemExit(f'FM1 endpoint unreachable: {type(exc.reason).__name__}') from None
+          for key in (
+              'accepted', 'ingest_status', 'routing_status', 'mapped_trigger_id',
+              'decision_status', 'decision_outcome', 'normalized_event_id',
+              'blocker_id', 'receipt_ref', 'reason_code',
+          ):
+              print(f'{key}: {result.get(key)}')
+          if result.get('accepted') is not True or result.get('mapped_trigger_id') != 'ER-053':
+              raise SystemExit('Incorrect ER-053 event routing')
+          if result.get('decision_status') != 'decided' or not result.get('receipt_ref'):
+              raise SystemExit('Missing F13 decision or receipt')
+          outcome = result.get('decision_outcome')
+          if mode == 'detect' and outcome == 'pass':
+              raise SystemExit('HIGH finding allowed; verify active F13 policy before certifying')
+          if mode == 'pass' and outcome != 'pass':
+              raise SystemExit('Remediated security scan did not pass F13 policy')
+          print('ER-053 intake, decision and receipt verified; inspect blocker in portal')
+          PY

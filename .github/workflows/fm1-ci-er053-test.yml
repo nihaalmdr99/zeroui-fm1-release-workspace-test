@@ -1,0 +1,124 @@
+
+name: FM1 CI ER053 Security Scan Test
+run-name: ER053 ${{ inputs.mode }} security fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Detect a real SAST finding or verify successful remediation"
+        required: true
+        type: choice
+        options:
+          - detect
+          - pass
+        default: detect
+
+permissions:
+  contents: read
+
+jobs:
+  security-scan:
+    name: FM1 ER053 Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install pinned Bandit scanner
+        run: python3 -m pip install --disable-pip-version-check bandit==1.9.4
+
+      - name: Scan controlled Python fixture
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+          TARGET_RUN_ID: ${{ github.run_id }}
+          TARGET_ATTEMPT: ${{ github.run_attempt }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          mode = os.environ['TEST_MODE']
+          if mode not in {'detect', 'pass'}:
+              raise SystemExit('Unexpected test mode')
+          proof = Path('er053-evidence').resolve()
+          proof.mkdir(exist_ok=True)
+          fixture = proof / 'fixture.py'
+
+          vulnerable_source = (
+              'import subprocess\n'
+              'def run_check(user_input):\n'
+              '    command = "/usr/bin/printf " + user_input\n'
+              '    return subprocess.run(command, shell=True, check=True)\n'
+          )
+          fixed_source = (
+              'import subprocess\n'
+              'def run_check(user_input):\n'
+              '    return subprocess.run(["/usr/bin/printf", "%s", user_input], check=True)\n'
+          )
+          fixture.write_text(
+              vulnerable_source if mode == 'detect' else fixed_source,
+              encoding='utf-8',
+          )
+          command = [
+              sys.executable, '-m', 'bandit', '-q', '-lll', '-f', 'json',
+              '-o', str(proof / 'scan.json'), str(fixture),
+          ]
+          scan = subprocess.run(command, capture_output=True, text=True)
+          if scan.returncode not in {0, 1}:
+              raise SystemExit(f'Bandit execution error: {scan.stderr[-1000:]}')
+          report_file = proof / 'scan.json'
+          if not report_file.is_file():
+              raise SystemExit('Bandit did not produce scan.json')
+          report = json.loads(report_file.read_text(encoding='utf-8'))
+          if report.get('errors'):
+              raise SystemExit('Bandit reported analysis errors')
+          findings = report.get('results')
+          if not isinstance(findings, list):
+              raise SystemExit('Missing scanner findings list')
+          if mode == 'detect':
+              if (len(findings) != 1 or
+                  findings[0].get('test_id') != 'B602' or
+                  findings[0].get('issue_severity') != 'HIGH' or
+                  findings[0].get('issue_confidence') != 'HIGH' or
+                  scan.returncode != 1):
+                  raise SystemExit('Expected one genuine HIGH B602 finding')
+          elif findings or scan.returncode != 0:
+              raise SystemExit('Remediated fixture still has HIGH findings')
+
+          summary = {
+              'schema': 'zeroui.er053.bandit_fixture.v1',
+              'mode': mode,
+              'run_id': os.environ['TARGET_RUN_ID'],
+              'run_attempt': os.environ['TARGET_ATTEMPT'],
+              'commit_sha': os.environ['TARGET_SHA'],
+              'scanner': 'bandit',
+              'scanner_version': '1.9.4',
+              'severity_filter': 'HIGH',
+              'scan_returncode': scan.returncode,
+              'finding_count': len(findings),
+              'finding_ids': [f['test_id'] for f in findings],
+              'scan_passed': not bool(findings),
+              'fixture_sha256': hashlib.sha256(fixture.read_bytes()).hexdigest(),
+              'scope': 'controlled_python_sast_fixture',
+          }
+          (proof / 'summary.json').write_text(
+              json.dumps(summary, indent=2), encoding='utf-8'
+          )
+          print('Scanner: Bandit 1.9.4; severity filter: HIGH')
+          print('Mode:', mode)
+          print('Verified HIGH findings:', len(findings))
+          print('Finding IDs:', summary['finding_ids'])
+          print('Scanner exit code:', scan.returncode)
+          PY
+
+      - name: Upload security scan evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm1-er053-security-${{ github.run_id }}-${{ github.run_attempt }}
+          path: er053-evidence/
+          if-no-files-found: error
+          retention-days: 7
