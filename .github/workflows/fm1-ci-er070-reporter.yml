@@ -180,6 +180,8 @@ jobs:
               'required_gate': True,
               'build_tool': 'pip wheel',
               'build_exit_code': return_code,
+              'build_passed': not failed,
+              'build_succeeded': not failed,
               'artifact_build_failed': failed,
               'artifact_built': not failed,
               'artifact_ref': 'python-wheel:fm1-er070-fixture@0.0.1',
