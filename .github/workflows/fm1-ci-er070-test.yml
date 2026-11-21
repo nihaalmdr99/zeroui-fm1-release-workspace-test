@@ -1,0 +1,143 @@
+
+name: FM1 CI ER070 Artifact Build Test
+run-name: ER070 ${{ inputs.mode }} artifact build fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Fail a real package build or verify a successful rebuild"
+        required: true
+        type: choice
+        options:
+          - fail
+          - pass
+        default: fail
+
+permissions:
+  contents: read
+
+jobs:
+  artifact-build:
+    name: FM1 ER070 Artifact Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install pinned packaging backend
+        run: python3 -m pip install --disable-pip-version-check setuptools==80.9.0 wheel==0.45.1
+
+      - name: Build Python wheel fixture
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+          TARGET_RUN_ID: ${{ github.run_id }}
+          TARGET_ATTEMPT: ${{ github.run_attempt }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import sys
+          import zipfile
+          from email.parser import Parser
+          from pathlib import Path
+
+          mode = os.environ['TEST_MODE']
+          if mode not in {'fail', 'pass'}:
+              raise SystemExit('Unexpected artifact build mode')
+
+          proof = Path('er070-evidence').resolve()
+          package = proof / 'package'
+          source = package / 'src' / 'fm1_er070_fixture' / '__init__.py'
+          dist = proof / 'dist'
+          source.parent.mkdir(parents=True, exist_ok=True)
+          dist.mkdir(parents=True, exist_ok=True)
+          source.write_text('def answer():\n    return 42\n', encoding='utf-8')
+
+          # Invalid version causes an actual packaging-backend failure.
+          version = 'invalid version' if mode == 'fail' else '0.0.1'
+          pyproject = package / 'pyproject.toml'
+          pyproject.write_text(
+              '[build-system]\n'
+              'requires = ["setuptools>=61", "wheel"]\n'
+              'build-backend = "setuptools.build_meta"\n\n'
+              '[project]\n'
+              'name = "fm1-er070-fixture"\n'
+              f'version = "{version}"\n'
+              'description = "Controlled ZeroUI artifact build fixture"\n\n'
+              '[tool.setuptools.packages.find]\n'
+              'where = ["src"]\n',
+              encoding='utf-8',
+          )
+
+          command = [
+              sys.executable, '-m', 'pip', 'wheel',
+              '--disable-pip-version-check', '--no-deps',
+              '--no-build-isolation', '--no-cache-dir',
+              '--wheel-dir', str(dist), str(package),
+          ]
+          build = subprocess.run(command, capture_output=True, text=True, check=False)
+          build_log = proof / 'build.log'
+          build_log.write_text(build.stdout + '\n' + build.stderr, encoding='utf-8')
+          wheels = sorted(dist.glob('*.whl'))
+          failure_marker = (
+              'project.version' in build_log.read_text(encoding='utf-8').lower()
+              and 'pep440' in build_log.read_text(encoding='utf-8').lower()
+          )
+
+          expected_wheel = 'fm1_er070_fixture-0.0.1-py3-none-any.whl'
+          wheel_sha256 = None
+          if mode == 'fail':
+              if build.returncode == 0 or wheels or not failure_marker:
+                  raise SystemExit('Expected real metadata-generation build failure not established')
+          else:
+              if build.returncode != 0 or len(wheels) != 1 or wheels[0].name != expected_wheel:
+                  raise SystemExit('Expected Python wheel build did not succeed')
+              with zipfile.ZipFile(wheels[0]) as archive:
+                  members = archive.namelist()
+                  metadata = [name for name in members if name.endswith('.dist-info/METADATA')]
+                  if 'fm1_er070_fixture/__init__.py' not in members or len(metadata) != 1:
+                      raise SystemExit('Built wheel is missing package content or metadata')
+                  info = Parser().parsestr(archive.read(metadata[0]).decode('utf-8'))
+                  if info.get('Name') != 'fm1-er070-fixture' or info.get('Version') != '0.0.1':
+                      raise SystemExit('Built wheel has unexpected package identity')
+              wheel_sha256 = hashlib.sha256(wheels[0].read_bytes()).hexdigest()
+
+          summary = {
+              'schema': 'zeroui.er070.wheel_build_fixture.v1',
+              'mode': mode,
+              'run_id': os.environ['TARGET_RUN_ID'],
+              'run_attempt': os.environ['TARGET_ATTEMPT'],
+              'commit_sha': os.environ['TARGET_SHA'],
+              'build_tool': 'pip wheel',
+              'build_family': 'artifact_build',
+              'check_family': 'artifact_build',
+              'required_gate': True,
+              'package_name': 'fm1-er070-fixture',
+              'package_version': version,
+              'expected_artifact_name': expected_wheel,
+              'build_exit_code': build.returncode,
+              'artifact_built': len(wheels) == 1,
+              'wheel_sha256': wheel_sha256,
+              'metadata_sha256': hashlib.sha256(pyproject.read_bytes()).hexdigest(),
+              'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+              'error_kind': 'invalid_project_version' if mode == 'fail' else None,
+              'scope': 'controlled_python_wheel_fixture',
+          }
+          (proof / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print('Mode:', mode)
+          print('Actual package build exit code:', build.returncode)
+          print('Actual wheel artifact built:', bool(wheels))
+          print('Failure evidenced by packaging backend:', failure_marker)
+          print('Wheel SHA-256:', wheel_sha256)
+          print('Fixture scope: not a production application build')
+          PY
+
+      - name: Upload artifact build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm1-er070-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: er070-evidence/
+          if-no-files-found: error
+          retention-days: 7
