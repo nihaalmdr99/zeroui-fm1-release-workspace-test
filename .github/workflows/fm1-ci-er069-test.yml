@@ -1,0 +1,29 @@
+
+name: FM1 CI ER069 Skipped Required Gate Test
+run-name: FM1 ER069 ${{ inputs.mode }} required gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Skip required gate or run a successful follow-up"
+        required: true
+        type: choice
+        options:
+          - skip
+          - pass
+        default: skip
+
+permissions:
+  contents: read
+
+jobs:
+  required-ci-gate:
+    name: FM1 ER069 Required CI Gate
+    if: ${{ inputs.mode == 'pass' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Execute mandatory CI gate
+        shell: bash
+        run: |
+          echo "The mandatory ER-069 CI gate actually executed and passed."
