@@ -1,0 +1,106 @@
+
+name: FM1 CI ER020 Artifact Signature Test
+run-name: ER020 ${{ inputs.mode }} artifact signature fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Unsigned artifact detection or signed artifact recovery'
+        required: true
+        type: choice
+        options:
+          - unsigned
+          - signed
+        default: unsigned
+
+permissions:
+  contents: read
+
+jobs:
+  artifact-signature:
+    name: FM1 ER020 Artifact Signature Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate artifact and verify signature evidence
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+          TARGET_RUN_ID: ${{ github.run_id }}
+          TARGET_ATTEMPT: ${{ github.run_attempt }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          mode = os.environ['TEST_MODE']
+          if mode not in ('unsigned', 'signed'):
+              raise SystemExit('Unexpected mode')
+          proof = Path('er020-evidence').resolve()
+          proof.mkdir(exist_ok=True)
+          artifact = proof / 'artifact.zip'
+          signature = proof / 'artifact.sig'
+          public_key = proof / 'signer-public.pem'
+          content = b'ZeroUI ER020 controlled artifact, version 1\n'
+          with zipfile.ZipFile(artifact, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+              archive.writestr('payload.txt', content)
+          with zipfile.ZipFile(artifact) as archive:
+              if archive.testzip() is not None or archive.namelist() != ['payload.txt'] or archive.read('payload.txt') != content:
+                  raise SystemExit('Artifact contents failed validation')
+
+          def openssl(*args):
+              outcome = subprocess.run(['openssl', *map(str, args)], capture_output=True, text=True, check=False)
+              if outcome.returncode != 0:
+                  raise SystemExit('OpenSSL operation failed: ' + ' '.join(str(a) for a in args[:2]))
+              return outcome.stdout.strip()
+
+          if mode == 'signed':
+              with tempfile.TemporaryDirectory(prefix='fm1-er020-key-') as temp:
+                  private_key = Path(temp) / 'temporary-private.pem'
+                  openssl('genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048', '-out', private_key)
+                  openssl('pkey', '-in', private_key, '-pubout', '-out', public_key)
+                  openssl('dgst', '-sha256', '-sign', private_key, '-out', signature, artifact)
+              if openssl('dgst', '-sha256', '-verify', public_key, '-signature', signature, artifact) != 'Verified OK':
+                  raise SystemExit('Signature verification failed')
+          present = signature.is_file()
+          verified = present and public_key.is_file() and (
+              openssl('dgst', '-sha256', '-verify', public_key, '-signature', signature, artifact) == 'Verified OK'
+          )
+          if present != (mode == 'signed') or verified != present or public_key.is_file() != present:
+              raise SystemExit('Unexpected signature evidence state')
+          summary = {
+              'schema': 'zeroui.er020.artifact_signature_fixture.v1',
+              'mode': mode,
+              'run_id': os.environ['TARGET_RUN_ID'],
+              'run_attempt': os.environ['TARGET_ATTEMPT'],
+              'commit_sha': os.environ['TARGET_SHA'],
+              'artifact_name': artifact.name,
+              'artifact_sha256': hashlib.sha256(artifact.read_bytes()).hexdigest(),
+              'signature_present': present,
+              'signature_verified': verified,
+              'signature_sha256': hashlib.sha256(signature.read_bytes()).hexdigest() if present else None,
+              'public_key_sha256': hashlib.sha256(public_key.read_bytes()).hexdigest() if present else None,
+              'signature_scheme': 'RSA-SHA256' if present else None,
+              'signer_scope': 'ephemeral_test_key_not_trusted_production',
+          }
+          (proof / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print('Mode:', mode)
+          print('Artifact SHA-256:', summary['artifact_sha256'])
+          print('Actual signature present:', present)
+          print('Actual cryptographic verification:', verified)
+          print('Production trust established: False')
+          PY
+
+      - name: Upload artifact signature evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm1-er020-signature-${{ github.run_id }}-${{ github.run_attempt }}
+          path: er020-evidence/
+          if-no-files-found: error
+          retention-days: 7
