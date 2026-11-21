@@ -1,0 +1,142 @@
+
+name: FM1 CI ER055 Missing SBOM Test
+run-name: ER055 ${{ inputs.mode }} sbom fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Detect a missing required SBOM or verify inventory recovery"
+        required: true
+        type: choice
+        options:
+          - missing
+          - pass
+        default: missing
+
+permissions:
+  contents: read
+
+jobs:
+  sbom-check:
+    name: FM1 ER055 Required SBOM Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate and inspect SBOM fixture
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+          TARGET_RUN_ID: ${{ github.run_id }}
+          TARGET_ATTEMPT: ${{ github.run_attempt }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import tomllib
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          mode = os.environ['TEST_MODE']
+          if mode not in {'missing', 'pass'}:
+              raise SystemExit('Unexpected test mode')
+          proof = Path('er055-evidence').resolve()
+          proof.mkdir(exist_ok=True)
+          metadata_file = proof / 'pyproject.toml'
+          sbom_file = proof / 'sbom.spdx.json'
+          metadata_file.write_text(
+              '[project]\n'
+              'name = "fm1-er055-fixture"\n'
+              'version = "0.0.1"\n'
+              'license = "MIT"\n',
+              encoding='utf-8',
+          )
+          project = tomllib.loads(metadata_file.read_text(encoding='utf-8'))['project']
+          if (project['name'] != 'fm1-er055-fixture' or
+                  project['version'] != '0.0.1' or project['license'] != 'MIT'):
+              raise SystemExit('Fixture package metadata is invalid')
+
+          if mode == 'pass':
+              document = {
+                  'spdxVersion': 'SPDX-2.3',
+                  'dataLicense': 'CC0-1.0',
+                  'SPDXID': 'SPDXRef-DOCUMENT',
+                  'name': 'FM1 ER055 controlled package SBOM',
+                  'documentNamespace': (
+                      'https://spdx.org/spdxdocs/fm1-er055-'
+                      f'{os.environ["TARGET_RUN_ID"]}-{os.environ["TARGET_ATTEMPT"]}'
+                  ),
+                  'creationInfo': {
+                      'created': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                      'creators': ['Tool: FM1-ER055-Controlled-Fixture'],
+                  },
+                  'packages': [{
+                      'SPDXID': 'SPDXRef-Package',
+                      'name': project['name'],
+                      'versionInfo': project['version'],
+                      'downloadLocation': 'NOASSERTION',
+                      'filesAnalyzed': False,
+                      'licenseDeclared': project['license'],
+                      'licenseConcluded': 'NOASSERTION',
+                      'copyrightText': 'NOASSERTION',
+                  }],
+                  'relationships': [{
+                      'spdxElementId': 'SPDXRef-DOCUMENT',
+                      'relatedSpdxElement': 'SPDXRef-Package',
+                      'relationshipType': 'DESCRIBES',
+                  }],
+              }
+              sbom_file.write_text(json.dumps(document, indent=2), encoding='utf-8')
+
+          # Determine inventory presence from the filesystem, not from the mode flag.
+          sbom_present = sbom_file.is_file()
+          if sbom_present:
+              actual = json.loads(sbom_file.read_text(encoding='utf-8'))
+              packages = actual.get('packages', [])
+              if (actual.get('spdxVersion') != 'SPDX-2.3' or
+                      actual.get('SPDXID') != 'SPDXRef-DOCUMENT' or
+                      actual.get('dataLicense') != 'CC0-1.0' or
+                      len(packages) != 1 or
+                      packages[0].get('name') != project['name'] or
+                      packages[0].get('versionInfo') != project['version'] or
+                      packages[0].get('licenseDeclared') != project['license'] or
+                      actual.get('relationships') != [{
+                          'spdxElementId': 'SPDXRef-DOCUMENT',
+                          'relatedSpdxElement': 'SPDXRef-Package',
+                          'relationshipType': 'DESCRIBES',
+                      }]):
+                  raise SystemExit('Generated inventory does not match fixture metadata')
+          if (mode == 'missing' and sbom_present) or (mode == 'pass' and not sbom_present):
+              raise SystemExit('SBOM presence is inconsistent with test mode')
+
+          summary = {
+              'schema': 'zeroui.er055.sbom_fixture.v1',
+              'mode': mode,
+              'run_id': os.environ['TARGET_RUN_ID'],
+              'run_attempt': os.environ['TARGET_ATTEMPT'],
+              'commit_sha': os.environ['TARGET_SHA'],
+              'sbom_required': True,
+              'expected_format': 'SPDX',
+              'sbom_present': sbom_present,
+              'sbom_file': 'sbom.spdx.json' if sbom_present else None,
+              'sbom_sha256': (hashlib.sha256(sbom_file.read_bytes()).hexdigest()
+                              if sbom_present else None),
+              'metadata_sha256': hashlib.sha256(metadata_file.read_bytes()).hexdigest(),
+              'scope': 'controlled_single_package_fixture',
+          }
+          (proof / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print('Required SBOM: true')
+          print('Expected format: SPDX')
+          print('SBOM present:', sbom_present)
+          print('Mode:', mode)
+          print('Scope: controlled single-package fixture only')
+          PY
+
+      - name: Upload SBOM evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm1-er055-sbom-${{ github.run_id }}-${{ github.run_attempt }}
+          path: er055-evidence/
+          if-no-files-found: error
+          retention-days: 7

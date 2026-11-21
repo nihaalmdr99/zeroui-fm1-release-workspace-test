@@ -1,0 +1,255 @@
+
+name: FM1 CI ER055 Completion Reporter
+
+on:
+  workflow_run:
+    workflows:
+      - FM1 CI ER055 Missing SBOM Test
+    types:
+      - completed
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  report-ci-result:
+    if: >-
+      ${{
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'workflow_dispatch' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download SBOM evidence from source run
+        uses: actions/download-artifact@v4
+        with:
+          name: fm1-er055-sbom-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: er055-evidence
+
+      - name: Verify SBOM evidence and report ER-055 to ZeroUI
+        shell: bash
+        env:
+          FM1_URL: ${{ vars.FM1_PUBLIC_BASE_URL }}
+          FM1_TOKEN: ${{ secrets.FM1_SIGNAL_INTAKE_AUTH_TOKEN }}
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TENANT_ID: ${{ vars.FM1_TENANT_ID }}
+          RELEASE_ID: ${{ vars.FM1_RELEASE_ID }}
+          RECHECK_BLOCKER_ID: ${{ vars.FM1_ER055_RECHECK_BLOCKER_ID }}
+          RECHECK_EVENT_ID: ${{ vars.FM1_ER055_RECHECK_EVENT_ID }}
+          TARGET_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+          TARGET_RUN_ID: ${{ github.event.workflow_run.id }}
+          TARGET_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          TARGET_NAME: ${{ github.event.workflow_run.name }}
+          TARGET_TITLE: ${{ github.event.workflow_run.display_title }}
+          TARGET_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import tomllib
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          def required(key):
+              value = os.environ.get(key, '').strip()
+              if not value:
+                  raise SystemExit(f'Missing required setting: {key}')
+              return value
+
+          repo = required('TARGET_REPO')
+          if repo != required('GITHUB_REPOSITORY'):
+              raise SystemExit('Unexpected GitHub repository')
+          run_id = required('TARGET_RUN_ID')
+          attempt = required('TARGET_ATTEMPT')
+          sha = required('TARGET_SHA')
+          proof = Path('er055-evidence')
+          summary = json.loads((proof / 'summary.json').read_text(encoding='utf-8'))
+          metadata_file = proof / 'pyproject.toml'
+          sbom_file = proof / 'sbom.spdx.json'
+          if summary.get('schema') != 'zeroui.er055.sbom_fixture.v1':
+              raise SystemExit('Unexpected SBOM evidence schema')
+          mode = summary.get('mode')
+          if mode not in {'missing', 'pass'}:
+              raise SystemExit('Invalid SBOM test mode')
+          if (summary.get('run_id') != run_id or
+                  str(summary.get('run_attempt')) != attempt or
+                  summary.get('commit_sha') != sha or
+                  required('TARGET_TITLE') != f'ER055 {mode} sbom fixture'):
+              raise SystemExit('SBOM evidence source run does not match GitHub')
+          if (summary.get('scope') != 'controlled_single_package_fixture' or
+                  summary.get('sbom_required') is not True or
+                  summary.get('expected_format') != 'SPDX'):
+              raise SystemExit('Required-SBOM context is missing')
+          files = {p.name for p in proof.iterdir() if p.is_file()}
+          expected_files = {'pyproject.toml', 'summary.json'}
+          if mode == 'pass':
+              expected_files.add('sbom.spdx.json')
+          if files != expected_files:
+              raise SystemExit(f'Unexpected or missing SBOM evidence files: {files}')
+          if summary.get('metadata_sha256') != hashlib.sha256(metadata_file.read_bytes()).hexdigest():
+              raise SystemExit('Package metadata integrity failed')
+          project = tomllib.loads(metadata_file.read_text(encoding='utf-8'))['project']
+          if (project.get('name') != 'fm1-er055-fixture' or
+                  project.get('version') != '0.0.1' or project.get('license') != 'MIT'):
+              raise SystemExit('Unexpected package metadata')
+          present = sbom_file.is_file()
+          if present != (mode == 'pass') or summary.get('sbom_present') is not present:
+              raise SystemExit('SBOM evidence presence and mode do not agree')
+          if present:
+              digest = hashlib.sha256(sbom_file.read_bytes()).hexdigest()
+              if summary.get('sbom_sha256') != digest or summary.get('sbom_file') != sbom_file.name:
+                  raise SystemExit('SBOM file integrity failed')
+              doc = json.loads(sbom_file.read_text(encoding='utf-8'))
+              packages = doc.get('packages', [])
+              if (doc.get('spdxVersion') != 'SPDX-2.3' or
+                      doc.get('dataLicense') != 'CC0-1.0' or
+                      doc.get('SPDXID') != 'SPDXRef-DOCUMENT' or
+                      not isinstance(doc.get('documentNamespace'), str) or
+                      not doc['documentNamespace'].endswith(f'fm1-er055-{run_id}-{attempt}') or
+                      not isinstance(doc.get('creationInfo', {}).get('created'), str) or
+                      not doc.get('creationInfo', {}).get('creators') or
+                      len(packages) != 1 or
+                      packages[0].get('SPDXID') != 'SPDXRef-Package' or
+                      packages[0].get('name') != project['name'] or
+                      packages[0].get('versionInfo') != project['version'] or
+                      packages[0].get('licenseDeclared') != project['license'] or
+                      doc.get('relationships') != [{
+                          'spdxElementId': 'SPDXRef-DOCUMENT',
+                          'relatedSpdxElement': 'SPDXRef-Package',
+                          'relationshipType': 'DESCRIBES',
+                      }]):
+                  raise SystemExit('SPDX inventory contents failed verification')
+          elif summary.get('sbom_sha256') is not None or summary.get('sbom_file') is not None:
+              raise SystemExit('Missing mode incorrectly claims an SBOM document')
+
+          api = (f'https://api.github.com/repos/{repo}/actions/runs/'
+                 f'{run_id}/attempts/{attempt}/jobs?per_page=100')
+          request = urllib.request.Request(api, headers={
+              'Authorization': 'Bearer ' + required('GH_API_TOKEN'),
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'User-Agent': 'ZeroUI-ER055-Reporter',
+          })
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  jobs_data = json.load(response)
+          except urllib.error.HTTPError as exc:
+              raise SystemExit(f'GitHub job lookup returned HTTP {exc.code}') from None
+          except urllib.error.URLError as exc:
+              raise SystemExit(f'GitHub job lookup failed: {type(exc.reason).__name__}') from None
+          jobs = jobs_data.get('jobs')
+          if not isinstance(jobs, list) or jobs_data.get('total_count') != 1:
+              raise SystemExit('Expected exactly one required SBOM source job')
+          job = jobs[0]
+          if (job.get('name') != 'FM1 ER055 Required SBOM Check' or
+                  job.get('status') != 'completed' or job.get('conclusion') != 'success'):
+              raise SystemExit('GitHub SBOM source job failed verification')
+          steps = {s['name']: s['conclusion'] for s in job.get('steps', [])}
+          if (steps.get('Generate and inspect SBOM fixture') != 'success' or
+                  steps.get('Upload SBOM evidence') != 'success'):
+              raise SystemExit('SBOM source evidence step failed')
+
+          base = required('FM1_URL').rstrip('/')
+          origin = urlsplit(base)
+          if (origin.scheme != 'https' or not origin.hostname or
+                  origin.username or origin.password or
+                  origin.path not in ('', '/') or origin.query or origin.fragment):
+              raise SystemExit('FM1_URL must be a public HTTPS origin')
+          print('Verified SBOM required: True')
+          print('Expected SBOM format: SPDX')
+          print('Actual SBOM present:', present)
+          print('Mode:', mode)
+          print('SBOM SHA-256:', summary.get('sbom_sha256'))
+          event_id = f'github-ci-er055-{run_id}-{attempt}-{job["id"]}'
+          payload = {
+              'sbom_required': True,
+              'expected_format': 'SPDX',
+              'sbom_present': present,
+              'sbom_missing': not present,
+              'sbom_format': 'SPDX' if present else None,
+              'sbom_document_sha256': summary.get('sbom_sha256'),
+              'sbom_scope': 'controlled_single_package_fixture',
+              'scan_passed': present,
+              'workflow_completed': True,
+              'required_gate': True,
+              'workflow_run_id': run_id,
+              'workflow_run_url': required('TARGET_URL'),
+              'job_id': job['id'],
+              'job_url': job.get('html_url'),
+          }
+          if mode == 'pass':
+              payload.update({
+                  'ci_recheck': True,
+                  'recheck_of_blocker_id': required('RECHECK_BLOCKER_ID'),
+                  'recheck_of_normalized_event_id': required('RECHECK_EVENT_ID'),
+                  'recheck_reason': 'required_spdx_sbom_now_present',
+              })
+          signal = {
+              'schema_version': '1',
+              'event_type_id': 'ci.sbom.missing',
+              'source_system': 'ci_cd',
+              'signal_method': 'pipeline_job',
+              'provider': 'github_actions',
+              'tenant_id': required('TENANT_ID'),
+              'release_key': required('RELEASE_ID'),
+              'release_id': required('RELEASE_ID'),
+              'repository': repo,
+              'branch': required('TARGET_BRANCH'),
+              'commit_hash': sha,
+              'trace_id': event_id,
+              'source_event_id': event_id,
+              'workflow_run_id': run_id,
+              'run_id': run_id,
+              'pipeline_id': run_id,
+              'workflow_name': required('TARGET_NAME'),
+              'payload': payload,
+              'raw_metadata': {
+                  'ci_runner_marker': 'github_actions',
+                  'ci_runner_detected': True,
+              },
+          }
+          request = urllib.request.Request(
+              base + '/fm1/v1/ci/signals',
+              data=json.dumps(signal).encode('utf-8'),
+              headers={
+                  'Content-Type': 'application/json',
+                  'X-FM1-Signal-Intake-Auth-Token': required('FM1_TOKEN'),
+              },
+              method='POST',
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+                  print('FM1 HTTP status:', response.status)
+          except urllib.error.HTTPError as exc:
+              print('FM1 HTTP status:', exc.code)
+              raise SystemExit('FM1 rejected ER-055 signal') from None
+          except urllib.error.URLError as exc:
+              raise SystemExit(f'FM1 endpoint unavailable: {type(exc.reason).__name__}') from None
+          for key in (
+              'accepted', 'ingest_status', 'routing_status', 'mapped_trigger_id',
+              'decision_status', 'decision_outcome', 'normalized_event_id',
+              'blocker_id', 'receipt_ref', 'reason_code',
+          ):
+              print(f'{key}: {result.get(key)}')
+          if result.get('accepted') is not True or result.get('mapped_trigger_id') != 'ER-055':
+              raise SystemExit('Wrong ER-055 intake or mapping')
+          if result.get('decision_status') != 'decided' or not result.get('receipt_ref'):
+              raise SystemExit('Missing F13 decision or receipt')
+          outcome = result.get('decision_outcome')
+          if mode == 'missing' and outcome != 'soft_block':
+              raise SystemExit('Expected ER-055 soft_block not observed; inspect tenant policy')
+          if mode == 'pass' and outcome != 'pass':
+              raise SystemExit('SBOM recovery did not pass F13 policy')
+          print('ER-055 event, F13 decision and receipt verified; check blocker in portal')
+          PY
