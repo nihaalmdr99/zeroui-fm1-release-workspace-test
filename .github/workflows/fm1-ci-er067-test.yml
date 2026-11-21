@@ -1,0 +1,43 @@
+
+name: FM1 CI ER067 Failed Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Fail a real unit test or run successful recovery"
+        required: true
+        type: choice
+        options:
+          - fail
+          - pass
+        default: fail
+
+permissions:
+  contents: read
+
+jobs:
+  required-tests:
+    name: FM1 ER067 Required Test Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run deterministic unit test
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import unittest
+
+          class RequiredTest(unittest.TestCase):
+              def test_required_validation(self):
+                  self.assertEqual(
+                      os.environ["TEST_MODE"],
+                      "pass",
+                      "Intentional unit-test failure for ER-067"
+                  )
+
+          unittest.main(verbosity=2)
+          PY
