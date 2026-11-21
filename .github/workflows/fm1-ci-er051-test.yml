@@ -1,0 +1,133 @@
+
+name: FM1 CI ER051 Coverage Dropped Test
+run-name: ER051 ${{ inputs.mode }} coverage fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Measured coverage regression or successful recovery"
+        required: true
+        type: choice
+        options:
+          - drop
+          - pass
+        default: drop
+
+permissions:
+  contents: read
+
+jobs:
+  coverage-measurement:
+    name: FM1 ER051 Coverage Measurement
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install coverage tool
+        run: python3 -m pip install --disable-pip-version-check coverage==7.10.7
+
+      - name: Measure baseline and candidate coverage
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+          TARGET_RUN_ID: ${{ github.run_id }}
+          TARGET_ATTEMPT: ${{ github.run_attempt }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          mode = os.environ['TEST_MODE']
+          if mode not in {'drop', 'pass'}:
+              raise SystemExit('Invalid mode')
+
+          work = Path('er051-work').resolve()
+          proof = Path('er051-evidence').resolve()
+          work.mkdir(exist_ok=True)
+          proof.mkdir(exist_ok=True)
+
+          baseline_source = '''\
+          def calculate(value):
+              if value < 0:
+                  return 0
+              return value + 1
+          '''
+          added_uncovered_code = '''\
+
+          def new_discount_logic(value):
+              if value is None:
+                  return 0
+              if value < 0:
+                  return -1
+              if value > 100:
+                  return 50
+              return value // 2
+          '''
+          tests = '''\
+          import unittest
+          from fixture import calculate
+
+          class RequiredCoverageTests(unittest.TestCase):
+              def test_negative(self):
+                  self.assertEqual(calculate(-1), 0)
+
+              def test_positive(self):
+                  self.assertEqual(calculate(2), 3)
+          '''
+          (work / 'test_fixture.py').write_text(tests, encoding='utf-8')
+
+          def measured_percent(source, output):
+              (work / 'fixture.py').write_text(source, encoding='utf-8')
+              subprocess.run([sys.executable, '-m', 'coverage', 'erase'], cwd=work, check=True)
+              subprocess.run([
+                  sys.executable, '-m', 'coverage', 'run', '--branch',
+                  '--source=fixture', '-m', 'unittest', '-q', 'test_fixture'
+              ], cwd=work, check=True)
+              subprocess.run([
+                  sys.executable, '-m', 'coverage', 'json', '-o', str(output)
+              ], cwd=work, check=True)
+              report = json.loads(output.read_text(encoding='utf-8'))
+              totals = report['totals']
+              if totals['num_statements'] <= 0:
+                  raise SystemExit('No executable lines measured')
+              return float(totals['percent_covered'])
+
+          baseline = measured_percent(baseline_source, proof / 'baseline.json')
+          current_source = baseline_source + (added_uncovered_code if mode == 'drop' else '')
+          current = measured_percent(current_source, proof / 'current.json')
+          threshold = 85.0  # Controlled fixture threshold, NOT the tenant's F13 policy.
+          if baseline < threshold:
+              raise SystemExit('Fixture baseline is unexpectedly below threshold')
+          if mode == 'drop' and not (current < threshold and current < baseline):
+              raise SystemExit('The controlled coverage regression did not occur')
+          if mode == 'pass' and not (current >= threshold and abs(current - baseline) < 0.01):
+              raise SystemExit('The recovered coverage measurement did not pass')
+
+          summary = {
+              'schema': 'zeroui.er051.coverage_fixture.v1',
+              'mode': mode,
+              'run_id': os.environ['TARGET_RUN_ID'],
+              'run_attempt': os.environ['TARGET_ATTEMPT'],
+              'commit_sha': os.environ['TARGET_SHA'],
+              'baseline_coverage_percent': baseline,
+              'current_coverage_percent': current,
+              'fixture_threshold_percent': threshold,
+              'coverage_scope': 'controlled_python_fixture',
+          }
+          (proof / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print('Measured baseline:', baseline)
+          print('Measured candidate:', current)
+          print('Controlled fixture threshold:', threshold)
+          print('Mode:', mode)
+          PY
+
+      - name: Upload measured coverage evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm1-er051-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: er051-evidence/
+          if-no-files-found: error
+          retention-days: 7
