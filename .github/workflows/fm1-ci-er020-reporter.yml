@@ -1,0 +1,252 @@
+
+name: FM1 CI ER020 Completion Reporter
+
+on:
+  workflow_run:
+    workflows:
+      - FM1 CI ER020 Artifact Signature Test
+    types:
+      - completed
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  report-ci-result:
+    if: >-
+      ${{
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'workflow_dispatch' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download signature evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: fm1-er020-signature-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: er020-evidence
+
+      - name: Verify cryptographic evidence and report ER-020 to ZeroUI
+        shell: bash
+        env:
+          FM1_URL: ${{ vars.FM1_PUBLIC_BASE_URL }}
+          FM1_TOKEN: ${{ secrets.FM1_SIGNAL_INTAKE_AUTH_TOKEN }}
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TENANT_ID: ${{ vars.FM1_TENANT_ID }}
+          RELEASE_ID: ${{ vars.FM1_RELEASE_ID }}
+          RECHECK_BLOCKER_ID: ${{ vars.FM1_ER020_RECHECK_BLOCKER_ID }}
+          RECHECK_EVENT_ID: ${{ vars.FM1_ER020_RECHECK_EVENT_ID }}
+          TARGET_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+          TARGET_RUN_ID: ${{ github.event.workflow_run.id }}
+          TARGET_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          TARGET_NAME: ${{ github.event.workflow_run.name }}
+          TARGET_TITLE: ${{ github.event.workflow_run.display_title }}
+          TARGET_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import urllib.error
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          def required(key):
+              value = os.environ.get(key, '').strip()
+              if not value:
+                  raise SystemExit('Missing required setting: ' + key)
+              return value
+
+          repo = required('TARGET_REPO')
+          if repo != required('GITHUB_REPOSITORY') or required('TARGET_BRANCH') != 'main':
+              raise SystemExit('Unexpected source repository or branch')
+          run_id = required('TARGET_RUN_ID')
+          attempt = required('TARGET_ATTEMPT')
+          sha = required('TARGET_SHA')
+          proof = Path('er020-evidence')
+          summary = json.loads((proof / 'summary.json').read_text(encoding='utf-8'))
+          artifact = proof / 'artifact.zip'
+          signature = proof / 'artifact.sig'
+          public_key = proof / 'signer-public.pem'
+          if summary.get('schema') != 'zeroui.er020.artifact_signature_fixture.v1':
+              raise SystemExit('Wrong signature evidence schema')
+          mode = summary.get('mode')
+          if mode not in ('unsigned', 'signed'):
+              raise SystemExit('Unexpected signature test mode')
+          if (summary.get('run_id') != run_id or
+                  str(summary.get('run_attempt')) != attempt or
+                  summary.get('commit_sha') != sha or
+                  required('TARGET_TITLE') != f'ER020 {mode} artifact signature fixture'):
+              raise SystemExit('Evidence does not match source GitHub run')
+          if (summary.get('signer_scope') != 'ephemeral_test_key_not_trusted_production' or
+                  summary.get('artifact_name') != 'artifact.zip'):
+              raise SystemExit('Evidence scope mismatch')
+          files = {p.name for p in proof.iterdir() if p.is_file()}
+          expected = {'artifact.zip', 'summary.json'}
+          if mode == 'signed':
+              expected.update({'artifact.sig', 'signer-public.pem'})
+          if files != expected:
+              raise SystemExit(f'Unexpected signature evidence file set: {files}')
+          artifact_bytes = artifact.read_bytes()
+          digest = hashlib.sha256(artifact_bytes).hexdigest()
+          if summary.get('artifact_sha256') != digest:
+              raise SystemExit('Artifact hash mismatch')
+          with zipfile.ZipFile(artifact) as archive:
+              if (archive.testzip() is not None or archive.namelist() != ['payload.txt'] or
+                      archive.read('payload.txt') != b'ZeroUI ER020 controlled artifact, version 1\n'):
+                  raise SystemExit('Invalid controlled artifact')
+          present = signature.is_file()
+          if present != (mode == 'signed') or summary.get('signature_present') is not present:
+              raise SystemExit('Signature presence inconsistent with files')
+          verified = False
+          if present:
+              if (summary.get('signature_sha256') != hashlib.sha256(signature.read_bytes()).hexdigest() or
+                      summary.get('public_key_sha256') != hashlib.sha256(public_key.read_bytes()).hexdigest() or
+                      summary.get('signature_scheme') != 'RSA-SHA256'):
+                  raise SystemExit('Signature metadata or hash mismatch')
+              verify = subprocess.run(
+                  ['openssl', 'dgst', '-sha256', '-verify', str(public_key),
+                   '-signature', str(signature), str(artifact)],
+                  text=True, capture_output=True, check=False,
+              )
+              verified = verify.returncode == 0 and verify.stdout.strip() == 'Verified OK'
+              if not verified:
+                  raise SystemExit('Actual RSA-SHA256 signature failed verification')
+          elif (summary.get('signature_sha256') is not None or
+                  summary.get('public_key_sha256') is not None or
+                  summary.get('signature_scheme') is not None):
+              raise SystemExit('Unsigned mode falsely claims signature data')
+          if summary.get('signature_verified') is not verified:
+              raise SystemExit('Signature verification summary mismatch')
+
+          url = (f'https://api.github.com/repos/{repo}/actions/runs/{run_id}'
+                 f'/attempts/{attempt}/jobs?per_page=100')
+          gh_request = urllib.request.Request(url, headers={
+              'Authorization': 'Bearer ' + required('GH_API_TOKEN'),
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'User-Agent': 'ZeroUI-ER020-Reporter',
+          })
+          try:
+              with urllib.request.urlopen(gh_request, timeout=30) as response:
+                  jobs_data = json.load(response)
+          except urllib.error.HTTPError as exc:
+              raise SystemExit(f'GitHub jobs lookup HTTP {exc.code}') from None
+          except urllib.error.URLError as exc:
+              raise SystemExit(f'GitHub jobs lookup unavailable: {type(exc.reason).__name__}') from None
+          jobs = jobs_data.get('jobs')
+          if not isinstance(jobs, list) or jobs_data.get('total_count') != 1:
+              raise SystemExit('Expected one source signature-check job')
+          job = jobs[0]
+          if (job.get('name') != 'FM1 ER020 Artifact Signature Check' or
+                  job.get('status') != 'completed' or job.get('conclusion') != 'success'):
+              raise SystemExit('Source signature-check job did not succeed')
+          steps = {step['name']: step['conclusion'] for step in job.get('steps', [])}
+          if (steps.get('Generate artifact and verify signature evidence') != 'success' or
+                  steps.get('Upload artifact signature evidence') != 'success'):
+              raise SystemExit('Source signature evidence steps were not successful')
+
+          base = required('FM1_URL').rstrip('/')
+          origin = urlsplit(base)
+          if (origin.scheme != 'https' or not origin.hostname or
+                  origin.username or origin.password or origin.path not in ('', '/') or
+                  origin.query or origin.fragment):
+              raise SystemExit('FM1_URL must be a public HTTPS origin')
+          event_id = f'github-ci-er020-{run_id}-{attempt}-{job["id"]}'
+          payload = {
+              'signature_required': True,
+              'signature_present': present,
+              'signed': present,
+              'signature_verified': verified,
+              'signature_scheme': summary.get('signature_scheme'),
+              'signer_scope': 'ephemeral_test_key_not_trusted_production',
+              'artifact_ref': 'artifact.zip',
+              'artifact_sha256': digest,
+              'signature_sha256': summary.get('signature_sha256'),
+              'public_key_sha256': summary.get('public_key_sha256'),
+              'required_gate': True,
+              'scan_passed': verified,
+              'workflow_completed': True,
+              'workflow_run_id': run_id,
+              'workflow_run_url': required('TARGET_URL'),
+              'job_id': job['id'],
+              'job_url': job.get('html_url'),
+          }
+          if mode == 'signed':
+              payload.update({
+                  'ci_recheck': True,
+                  'recheck_of_blocker_id': required('RECHECK_BLOCKER_ID'),
+                  'recheck_of_normalized_event_id': required('RECHECK_EVENT_ID'),
+                  'recheck_reason': 'controlled_artifact_signature_verified',
+              })
+          signal = {
+              'schema_version': '1',
+              'event_type_id': 'ci.artifact.unsigned',
+              'source_system': 'ci_cd',
+              'signal_method': 'pipeline_job',
+              'provider': 'github_actions',
+              'tenant_id': required('TENANT_ID'),
+              'release_key': required('RELEASE_ID'),
+              'release_id': required('RELEASE_ID'),
+              'repository': repo,
+              'branch': required('TARGET_BRANCH'),
+              'commit_hash': sha,
+              'trace_id': event_id,
+              'source_event_id': event_id,
+              'workflow_run_id': run_id,
+              'run_id': run_id,
+              'pipeline_id': run_id,
+              'workflow_name': required('TARGET_NAME'),
+              'payload': payload,
+              'raw_metadata': {
+                  'ci_runner_marker': 'github_actions',
+                  'ci_runner_detected': True,
+              },
+          }
+          fm1_request = urllib.request.Request(
+              base + '/fm1/v1/ci/signals',
+              data=json.dumps(signal).encode('utf-8'),
+              headers={
+                  'Content-Type': 'application/json',
+                  'X-FM1-Signal-Intake-Auth-Token': required('FM1_TOKEN'),
+              },
+              method='POST',
+          )
+          try:
+              with urllib.request.urlopen(fm1_request, timeout=30) as response:
+                  result = json.load(response)
+                  print('FM1 HTTP status:', response.status)
+          except urllib.error.HTTPError as exc:
+              raise SystemExit(f'FM1 rejected ER-020 signal: HTTP {exc.code}') from None
+          except urllib.error.URLError as exc:
+              raise SystemExit(f'FM1 endpoint unavailable: {type(exc.reason).__name__}') from None
+          print('Mode:', mode)
+          print('Actual signature present:', present)
+          print('Cryptographic verification:', verified)
+          for key in (
+              'accepted', 'ingest_status', 'routing_status', 'mapped_trigger_id',
+              'decision_status', 'decision_outcome', 'normalized_event_id',
+              'blocker_id', 'receipt_ref', 'reason_code',
+          ):
+              print(f'{key}: {result.get(key)}')
+          if result.get('accepted') is not True or result.get('mapped_trigger_id') != 'ER-020':
+              raise SystemExit('Wrong ER-020 intake or routing result')
+          if result.get('decision_status') != 'decided' or not result.get('receipt_ref'):
+              raise SystemExit('Missing F13 decision or receipt')
+          outcome = result.get('decision_outcome')
+          if mode == 'unsigned' and outcome not in ('hard_block', 'soft_block'):
+              raise SystemExit('Missing signature did not produce a blocking decision')
+          if mode == 'signed' and outcome != 'pass':
+              raise SystemExit('Verified artifact signature did not pass F13 policy')
+          print('ER-020 event, F13 decision and receipt verified; confirm blocker status in portal')
+          PY
