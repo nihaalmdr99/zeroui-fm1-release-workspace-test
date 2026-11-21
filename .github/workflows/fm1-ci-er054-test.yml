@@ -1,0 +1,110 @@
+
+name: FM1 CI ER054 License Policy Test
+run-name: ER054 ${{ inputs.mode }} license fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Reject a declared license or verify allowed-license recovery"
+        required: true
+        type: choice
+        options:
+          - deny
+          - pass
+        default: deny
+
+permissions:
+  contents: read
+
+jobs:
+  license-evaluation:
+    name: FM1 ER054 License Evaluation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate declared package license
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+          TARGET_RUN_ID: ${{ github.run_id }}
+          TARGET_ATTEMPT: ${{ github.run_attempt }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          if sys.version_info < (3, 11):
+              raise SystemExit('Python 3.11+ is required for tomllib')
+          mode = os.environ['TEST_MODE']
+          if mode not in {'deny', 'pass'}:
+              raise SystemExit('Unexpected test mode')
+          proof = Path('er054-evidence').resolve()
+          proof.mkdir(exist_ok=True)
+          metadata_path = proof / 'pyproject.toml'
+          policy_path = proof / 'fixture-policy.json'
+
+          # The test fixture's policy is NOT the tenant's authoritative license policy.
+          policy = {
+              'schema': 'zeroui.er054.fixture_license_policy.v1',
+              'scope': 'controlled_fixture_not_tenant_policy',
+              'allowed_license_ids': ['MIT', 'Apache-2.0'],
+              'denied_license_ids': ['GPL-3.0'],
+          }
+          policy_path.write_text(json.dumps(policy, indent=2), encoding='utf-8')
+          license_id = 'GPL-3.0' if mode == 'deny' else 'MIT'
+          metadata_path.write_text(
+              '[project]\n'
+              'name = "fm1-er054-license-fixture"\n'
+              'version = "0.0.1"\n'
+              f'license = "{license_id}"\n',
+              encoding='utf-8',
+          )
+
+          # Read the package's declared license; do not derive verdict from mode.
+          metadata = tomllib.loads(metadata_path.read_text(encoding='utf-8'))
+          observed_license = metadata['project']['license']
+          if not isinstance(observed_license, str) or not observed_license:
+              raise SystemExit('Invalid package license metadata')
+          loaded_policy = json.loads(policy_path.read_text(encoding='utf-8'))
+          allowed = set(loaded_policy['allowed_license_ids'])
+          denied = set(loaded_policy['denied_license_ids'])
+          if allowed & denied or observed_license not in (allowed | denied):
+              raise SystemExit('Overlapping or unknown fixture license policy')
+          verdict = 'denied' if observed_license in denied else 'allowed'
+          if mode == 'deny' and verdict != 'denied':
+              raise SystemExit('Expected policy denial did not occur')
+          if mode == 'pass' and verdict != 'allowed':
+              raise SystemExit('Expected policy approval did not occur')
+
+          summary = {
+              'schema': 'zeroui.er054.license_evidence.v1',
+              'mode': mode,
+              'run_id': os.environ['TARGET_RUN_ID'],
+              'run_attempt': os.environ['TARGET_ATTEMPT'],
+              'commit_sha': os.environ['TARGET_SHA'],
+              'license_id': observed_license,
+              'policy_verdict': verdict,
+              'license_policy_failed': verdict == 'denied',
+              'metadata_sha256': hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
+              'policy_sha256': hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+              'evaluation_scope': 'controlled_package_metadata_fixture',
+          }
+          (proof / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print('Declared package license:', observed_license)
+          print('Fixture policy verdict:', verdict)
+          print('Mode:', mode)
+          print('Scope: controlled package metadata, not tenant license-policy proof')
+          PY
+
+      - name: Upload license evaluation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm1-er054-license-${{ github.run_id }}-${{ github.run_attempt }}
+          path: er054-evidence/
+          if-no-files-found: error
+          retention-days: 7
