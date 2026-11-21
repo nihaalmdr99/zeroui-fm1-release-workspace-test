@@ -1,0 +1,268 @@
+
+name: FM1 CI ER007 Completion Reporter
+
+on:
+  workflow_run:
+    workflows:
+      - FM1 CI ER007 Database Migration Test
+    types:
+      - completed
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  report-ci-result:
+    if: >-
+      ${{
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'workflow_dispatch' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download migration evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: fm1-er007-migration-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: er007-evidence
+
+      - name: Verify migration evidence and report ER-007 to ZeroUI
+        shell: bash
+        env:
+          FM1_URL: ${{ vars.FM1_PUBLIC_BASE_URL }}
+          FM1_TOKEN: ${{ secrets.FM1_SIGNAL_INTAKE_AUTH_TOKEN }}
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TENANT_ID: ${{ vars.FM1_TENANT_ID }}
+          RELEASE_ID: ${{ vars.FM1_RELEASE_ID }}
+          RECHECK_BLOCKER_ID: ${{ vars.FM1_ER007_RECHECK_BLOCKER_ID }}
+          RECHECK_EVENT_ID: ${{ vars.FM1_ER007_RECHECK_EVENT_ID }}
+          TARGET_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+          TARGET_RUN_ID: ${{ github.event.workflow_run.id }}
+          TARGET_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          TARGET_NAME: ${{ github.event.workflow_run.name }}
+          TARGET_TITLE: ${{ github.event.workflow_run.display_title }}
+          TARGET_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import sqlite3
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          def required(key):
+              value = os.environ.get(key, '').strip()
+              if not value:
+                  raise SystemExit('Missing required setting: ' + key)
+              return value
+
+          repo = required('TARGET_REPO')
+          if repo != required('GITHUB_REPOSITORY') or required('TARGET_BRANCH') != 'main':
+              raise SystemExit('Unexpected source repository or branch')
+          run_id = required('TARGET_RUN_ID')
+          attempt = required('TARGET_ATTEMPT')
+          sha = required('TARGET_SHA')
+          proof = Path('er007-evidence')
+          if {p.name for p in proof.iterdir() if p.is_file()} != {'baseline.sql', 'migration.sql', 'summary.json'}:
+              raise SystemExit('Unexpected migration evidence file set')
+          summary = json.loads((proof / 'summary.json').read_text(encoding='utf-8'))
+          if summary.get('schema') != 'zeroui.er007.sqlite_migration_fixture.v1':
+              raise SystemExit('Wrong migration evidence schema')
+          mode = summary.get('mode')
+          if mode not in ('fail', 'pass'):
+              raise SystemExit('Unexpected migration mode')
+          if (summary.get('run_id') != run_id or
+                  str(summary.get('run_attempt')) != attempt or
+                  summary.get('commit_sha') != sha or
+                  required('TARGET_TITLE') != f'ER007 {mode} database migration fixture'):
+              raise SystemExit('Evidence does not match source GitHub run')
+          if (summary.get('database_engine') != 'sqlite' or
+                  summary.get('database_scope') != 'isolated_in_memory_fixture' or
+                  summary.get('row_count') != 2 or
+                  summary.get('baseline_rows_preserved') is not True or
+                  summary.get('integrity_check_passed') is not True):
+              raise SystemExit('Migration fixture state was not preserved')
+          baseline = (proof / 'baseline.sql').read_text(encoding='utf-8')
+          migration = (proof / 'migration.sql').read_text(encoding='utf-8')
+          expected_baseline = (
+              'CREATE TABLE er007_orders (order_id INTEGER PRIMARY KEY, description TEXT NOT NULL);\n'
+              "INSERT INTO er007_orders VALUES (1, 'alpha'), (2, 'beta');\n"
+          )
+          expected_migration = (
+              'ALTER TABLE er007_orders ADD COLUMN compliance_tag TEXT NOT NULL;\n'
+              if mode == 'fail' else
+              "ALTER TABLE er007_orders ADD COLUMN compliance_tag TEXT NOT NULL DEFAULT 'unclassified';\n"
+          )
+          if baseline != expected_baseline or migration != expected_migration:
+              raise SystemExit('Unexpected controlled migration SQL')
+          if (summary.get('baseline_sha256') != hashlib.sha256(baseline.encode()).hexdigest() or
+                  summary.get('migration_sha256') != hashlib.sha256(migration.encode()).hexdigest()):
+              raise SystemExit('Migration SQL hash mismatch')
+          if summary.get('sqlite_version') != sqlite3.sqlite_version:
+              raise SystemExit('Source and reporter SQLite versions differ')
+          db = sqlite3.connect(':memory:')
+          try:
+              db.executescript(baseline)
+              before = db.execute('SELECT order_id, description FROM er007_orders ORDER BY order_id').fetchall()
+              if before != [(1, 'alpha'), (2, 'beta')]:
+                  raise SystemExit('Unexpected database baseline')
+              failure = None
+              try:
+                  db.execute(migration)
+              except sqlite3.OperationalError as exc:
+                  failure = str(exc)
+              columns = db.execute('PRAGMA table_info(er007_orders)').fetchall()
+              after = db.execute('SELECT order_id, description FROM er007_orders ORDER BY order_id').fetchall()
+              integrity = db.execute('PRAGMA integrity_check').fetchone()[0]
+              has_column = any(row[1] == 'compliance_tag' and row[3] == 1 for row in columns)
+              if mode == 'fail':
+                  if (failure != 'Cannot add a NOT NULL column with default value NULL' or
+                          has_column or after != before or integrity != 'ok'):
+                      raise SystemExit('Could not reproduce actual migration validation failure')
+              else:
+                  tagged = db.execute('SELECT compliance_tag FROM er007_orders ORDER BY order_id').fetchall()
+                  if (failure is not None or not has_column or after != before or
+                          tagged != [('unclassified',), ('unclassified',)] or integrity != 'ok'):
+                      raise SystemExit('Could not reproduce corrected migration success')
+              valid = mode == 'pass'
+              if (summary.get('migration_error') != failure or
+                      summary.get('new_required_column_present') is not has_column or
+                      summary.get('validation_passed') is not valid or
+                      summary.get('scan_passed') is not valid):
+                  raise SystemExit('Migration summary contradicts independently reproduced result')
+          finally:
+              db.close()
+
+          api = (f'https://api.github.com/repos/{repo}/actions/runs/'
+                 f'{run_id}/attempts/{attempt}/jobs?per_page=100')
+          gh_request = urllib.request.Request(api, headers={
+              'Authorization': 'Bearer ' + required('GH_API_TOKEN'),
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'User-Agent': 'ZeroUI-ER007-Reporter',
+          })
+          try:
+              with urllib.request.urlopen(gh_request, timeout=30) as response:
+                  job_data = json.load(response)
+          except urllib.error.HTTPError as exc:
+              raise SystemExit(f'GitHub jobs lookup HTTP {exc.code}') from None
+          except urllib.error.URLError as exc:
+              raise SystemExit(f'GitHub jobs lookup unavailable: {type(exc.reason).__name__}') from None
+          jobs = job_data.get('jobs')
+          if not isinstance(jobs, list) or job_data.get('total_count') != 1:
+              raise SystemExit('Expected exactly one source migration job')
+          job = jobs[0]
+          if (job.get('name') != 'FM1 ER007 Database Migration Check' or
+                  job.get('status') != 'completed' or job.get('conclusion') != 'success'):
+              raise SystemExit('Source migration job did not complete successfully')
+          steps = {step['name']: step['conclusion'] for step in job.get('steps', [])}
+          if (steps.get('Execute real migration and record evidence') != 'success' or
+                  steps.get('Upload migration validation evidence') != 'success'):
+              raise SystemExit('Source migration evidence steps were not successful')
+
+          base = required('FM1_URL').rstrip('/')
+          parsed = urlsplit(base)
+          if (parsed.scheme != 'https' or not parsed.hostname or
+                  parsed.username or parsed.password or parsed.path not in ('', '/') or
+                  parsed.query or parsed.fragment):
+              raise SystemExit('FM1_URL must be an HTTPS origin')
+          event_id = f'github-ci-er007-{run_id}-{attempt}-{job["id"]}'
+          payload = {
+              'check_family': 'db_migration',
+              'migration_tool': 'sqlite3',
+              'migration_file': 'migration.sql',
+              'migration_sha256': summary['migration_sha256'],
+              'baseline_sha256': summary['baseline_sha256'],
+              'database_scope': 'isolated_in_memory_fixture',
+              'migration_error': failure,
+              'validation_passed': valid,
+              'scan_passed': valid,
+              'integrity_check_passed': True,
+              'baseline_rows_preserved': True,
+              'new_required_column_present': has_column,
+              'approved_exception': False,
+              'required_gate': True,
+              'workflow_completed': True,
+              'workflow_run_id': run_id,
+              'workflow_run_url': required('TARGET_URL'),
+              'job_id': job['id'],
+              'job_url': job.get('html_url'),
+          }
+          if mode == 'pass':
+              payload.update({
+                  'ci_recheck': True,
+                  'recheck_of_blocker_id': required('RECHECK_BLOCKER_ID'),
+                  'recheck_of_normalized_event_id': required('RECHECK_EVENT_ID'),
+                  'recheck_reason': 'corrected_sqlite_migration_validated',
+              })
+          signal = {
+              'schema_version': '1',
+              'event_type_id': 'ci.db_migration.check_failed',
+              'source_system': 'ci_cd',
+              'signal_method': 'pipeline_job',
+              'provider': 'github_actions',
+              'tenant_id': required('TENANT_ID'),
+              'release_key': required('RELEASE_ID'),
+              'release_id': required('RELEASE_ID'),
+              'repository': repo,
+              'branch': required('TARGET_BRANCH'),
+              'commit_hash': sha,
+              'trace_id': event_id,
+              'source_event_id': event_id,
+              'workflow_run_id': run_id,
+              'run_id': run_id,
+              'pipeline_id': run_id,
+              'workflow_name': required('TARGET_NAME'),
+              'payload': payload,
+              'raw_metadata': {
+                  'ci_runner_marker': 'github_actions',
+                  'ci_runner_detected': True,
+              },
+          }
+          request = urllib.request.Request(
+              base + '/fm1/v1/ci/signals',
+              data=json.dumps(signal).encode('utf-8'),
+              headers={
+                  'Content-Type': 'application/json',
+                  'X-FM1-Signal-Intake-Auth-Token': required('FM1_TOKEN'),
+              },
+              method='POST',
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+                  print('FM1 HTTP status:', response.status)
+          except urllib.error.HTTPError as exc:
+              raise SystemExit(f'FM1 rejected ER-007 signal: HTTP {exc.code}') from None
+          except urllib.error.URLError as exc:
+              raise SystemExit(f'FM1 endpoint unavailable: {type(exc.reason).__name__}') from None
+          print('Mode:', mode)
+          print('Actual migration error:', failure)
+          print('Migration validation passed:', valid)
+          for key in (
+              'accepted', 'ingest_status', 'routing_status', 'mapped_trigger_id',
+              'decision_status', 'decision_outcome', 'normalized_event_id',
+              'blocker_id', 'receipt_ref', 'reason_code',
+          ):
+              print(f'{key}: {result.get(key)}')
+          if result.get('accepted') is not True or result.get('mapped_trigger_id') != 'ER-007':
+              raise SystemExit('Incorrect ER-007 event intake or routing')
+          if result.get('decision_status') != 'decided' or not result.get('receipt_ref'):
+              raise SystemExit('Missing F13 decision or receipt')
+          outcome = result.get('decision_outcome')
+          if mode == 'fail' and outcome not in ('hard_block', 'soft_block'):
+              raise SystemExit('Invalid migration did not produce a blocking F13 decision')
+          if mode == 'pass' and outcome != 'pass':
+              raise SystemExit('Corrected migration did not pass F13 policy')
+          print('ER-007 decision and receipt verified; confirm blocker in portal')
+          PY
