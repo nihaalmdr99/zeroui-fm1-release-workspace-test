@@ -1,0 +1,116 @@
+
+name: FM1 CI ER007 Database Migration Test
+run-name: ER007 ${{ inputs.mode }} database migration fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Migration validation failure or corrected migration'
+        required: true
+        type: choice
+        options:
+          - fail
+          - pass
+        default: fail
+
+permissions:
+  contents: read
+
+jobs:
+  migration-test:
+    name: FM1 ER007 Database Migration Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Execute real migration and record evidence
+        shell: bash
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+          TARGET_RUN_ID: ${{ github.run_id }}
+          TARGET_ATTEMPT: ${{ github.run_attempt }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import sqlite3
+          from pathlib import Path
+
+          mode = os.environ['TEST_MODE']
+          if mode not in ('fail', 'pass'):
+              raise SystemExit('Unexpected migration mode')
+          proof = Path('er007-evidence')
+          proof.mkdir(exist_ok=True)
+          baseline = (
+              'CREATE TABLE er007_orders (order_id INTEGER PRIMARY KEY, description TEXT NOT NULL);\n'
+              "INSERT INTO er007_orders VALUES (1, 'alpha'), (2, 'beta');\n"
+          )
+          migration = (
+              'ALTER TABLE er007_orders ADD COLUMN compliance_tag TEXT NOT NULL;\n'
+              if mode == 'fail' else
+              "ALTER TABLE er007_orders ADD COLUMN compliance_tag TEXT NOT NULL DEFAULT 'unclassified';\n"
+          )
+          (proof / 'baseline.sql').write_text(baseline, encoding='utf-8')
+          (proof / 'migration.sql').write_text(migration, encoding='utf-8')
+          db = sqlite3.connect(':memory:')
+          try:
+              db.executescript(baseline)
+              before = db.execute('SELECT order_id, description FROM er007_orders ORDER BY order_id').fetchall()
+              if before != [(1, 'alpha'), (2, 'beta')]:
+                  raise SystemExit('Unexpected baseline data')
+              failure = None
+              try:
+                  db.execute(migration)
+              except sqlite3.OperationalError as exc:
+                  failure = str(exc)
+              columns = db.execute('PRAGMA table_info(er007_orders)').fetchall()
+              after = db.execute('SELECT order_id, description FROM er007_orders ORDER BY order_id').fetchall()
+              integrity = db.execute('PRAGMA integrity_check').fetchone()[0]
+              has_column = any(row[1] == 'compliance_tag' and row[3] == 1 for row in columns)
+              if mode == 'fail':
+                  if (failure != 'Cannot add a NOT NULL column with default value NULL' or
+                          has_column or after != before or integrity != 'ok'):
+                      raise SystemExit('Real migration failure evidence inconsistent')
+              else:
+                  tagged = db.execute('SELECT compliance_tag FROM er007_orders ORDER BY order_id').fetchall()
+                  if (failure is not None or not has_column or after != before or
+                          tagged != [('unclassified',), ('unclassified',)] or integrity != 'ok'):
+                      raise SystemExit('Corrected migration validation failed')
+              validated = mode == 'pass'
+              summary = {
+                  'schema': 'zeroui.er007.sqlite_migration_fixture.v1',
+                  'mode': mode,
+                  'run_id': os.environ['TARGET_RUN_ID'],
+                  'run_attempt': os.environ['TARGET_ATTEMPT'],
+                  'commit_sha': os.environ['TARGET_SHA'],
+                  'database_engine': 'sqlite',
+                  'database_scope': 'isolated_in_memory_fixture',
+                  'sqlite_version': sqlite3.sqlite_version,
+                  'baseline_sha256': hashlib.sha256(baseline.encode()).hexdigest(),
+                  'migration_sha256': hashlib.sha256(migration.encode()).hexdigest(),
+                  'baseline_rows_preserved': after == before,
+                  'row_count': len(after),
+                  'migration_error': failure,
+                  'validation_passed': validated,
+                  'scan_passed': validated,
+                  'integrity_check_passed': integrity == 'ok',
+                  'new_required_column_present': has_column,
+              }
+              (proof / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+              print('Mode:', mode)
+              print('Real SQLite migration error:', failure)
+              print('Migration validation passed:', validated)
+              print('Original rows preserved:', after == before)
+              print('Database integrity:', integrity)
+          finally:
+              db.close()
+          PY
+
+      - name: Upload migration validation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm1-er007-migration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: er007-evidence/
+          if-no-files-found: error
+          retention-days: 7
